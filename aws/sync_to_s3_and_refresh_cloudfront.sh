@@ -99,13 +99,11 @@ get_distribution_id_by_alias() {
   echo "$dist_id" # Return the ID
 }
 
-
-# --- Core Deployment Function ---
 sync_and_invalidate() {
   local local_path="$1"; local s3_target_uri="$2"; local distribution_id="$3"; local aws_cli_opts="$4"
-  # Extract bucket name and prefix from the URI for sed command later
+  # Extract bucket name from the URI
   local bucket_name_from_uri=$(echo "$s3_target_uri" | sed -n 's#^s3://\([^/]*\).*#\1#p')
-  local s3_prefix_from_uri=$(echo "$s3_target_uri" | sed -n 's#^s3://[^/]*/\(.*\)#\1#p')
+  # s3_prefix_from_uri is not needed for path generation anymore, but keep if used elsewhere
 
   echo ""; echo "Starting sync and invalidation..."
   echo "  Local Path: ${local_path}"; echo "  S3 Target URI: ${s3_target_uri}"; echo "  CloudFront Distribution ID: ${distribution_id}"
@@ -124,19 +122,27 @@ sync_and_invalidate() {
   while IFS= read -r line; do
     if [[ "$line" == upload:* ]] || [[ "$line" == copy:* ]] || [[ "$line" == delete:* ]]; then
       local s3_path_full_uri=$(echo "$line" | awk -F ' to | delete: ' '{print $NF}')
-      local sed_expr; if [ -n "$s3_prefix_from_uri" ]; then sed_expr="s#^s3://${bucket_name_from_uri}/${s3_prefix_from_uri}/##"; else sed_expr="s#^s3://${bucket_name_from_uri}/##"; fi
-      local s3_relative_path=$(echo "$s3_path_full_uri" | sed -e "$sed_expr")
-      local cf_path="/${s3_relative_path}"
+
+      # *** MODIFIED LOGIC HERE ***
+      # Remove only the 's3://<bucket_name>/' part to get the full object key
+      local s3_object_key=$(echo "$s3_path_full_uri" | sed -e "s#^s3://${bucket_name_from_uri}/##")
+
+      # Prepend '/' to the object key for the CloudFront path
+      local cf_path="/${s3_object_key}"
+      # *** END MODIFIED LOGIC ***
+
       # Basic uniqueness check
       if [[ ! " ${INVALIDATION_PATHS[@]} " =~ " ${cf_path} " ]]; then INVALIDATION_PATHS+=("$cf_path"); fi
     fi
   done < <(echo "$SYNC_OUTPUT")
 
-  # Step 3: Invalidate
+  # Step 3: Invalidate (Rest remains the same)
   if [ ${#INVALIDATION_PATHS[@]} -eq 0 ]; then
     echo ""; echo "No files changed. Skipping CloudFront invalidation.";
   else
-    echo ""; echo "Found ${#INVALIDATION_PATHS[@]} changed file(s) requiring invalidation."
+    echo ""; echo "Found ${#INVALIDATION_PATHS[@]} changed file(s) requiring invalidation:"
+    # Optional: print paths for debugging BEFORE sending to AWS
+    # printf "  %s\n" "${INVALIDATION_PATHS[@]}"
     if [ ${#INVALIDATION_PATHS[@]} -gt 1000 ]; then echo "Warning: >1000 paths detected. Consider using a wildcard ('/*')."; fi
     echo "Creating CloudFront invalidation..."; local INVALIDATION_RESULT
     INVALIDATION_RESULT=$(aws cloudfront create-invalidation --distribution-id "${distribution_id}" --paths "${INVALIDATION_PATHS[@]}" ${aws_cli_opts} 2>&1) || {
