@@ -103,7 +103,7 @@ sync_and_invalidate() {
   local local_path="$1"; local s3_target_uri="$2"; local distribution_id="$3"; local aws_cli_opts="$4"
   # Extract bucket name from the URI
   local bucket_name_from_uri=$(echo "$s3_target_uri" | sed -n 's#^s3://\([^/]*\).*#\1#p')
-  # s3_prefix_from_uri is not needed for path generation anymore, but keep if used elsewhere
+  # s3_prefix_from_uri is not needed for path generation anymore
 
   echo ""; echo "Starting sync and invalidation..."
   echo "  Local Path: ${local_path}"; echo "  S3 Target URI: ${s3_target_uri}"; echo "  CloudFront Distribution ID: ${distribution_id}"
@@ -119,35 +119,69 @@ sync_and_invalidate() {
   # Step 2: Parse
   echo ""; echo "Parsing sync output for invalidation..."
   declare -a INVALIDATION_PATHS
+  echo "--- Paths identified for invalidation (pre-processing): ---" # DEBUG
   while IFS= read -r line; do
     if [[ "$line" == upload:* ]] || [[ "$line" == copy:* ]] || [[ "$line" == delete:* ]]; then
       local s3_path_full_uri=$(echo "$line" | awk -F ' to | delete: ' '{print $NF}')
-
-      # *** MODIFIED LOGIC HERE ***
       # Remove only the 's3://<bucket_name>/' part to get the full object key
       local s3_object_key=$(echo "$s3_path_full_uri" | sed -e "s#^s3://${bucket_name_from_uri}/##")
-
       # Prepend '/' to the object key for the CloudFront path
       local cf_path="/${s3_object_key}"
-      # *** END MODIFIED LOGIC ***
+
+      # DEBUG: Print each generated path
+      echo "  Generated CF Path: ->${cf_path}<-"
 
       # Basic uniqueness check
-      if [[ ! " ${INVALIDATION_PATHS[@]} " =~ " ${cf_path} " ]]; then INVALIDATION_PATHS+=("$cf_path"); fi
+      if [[ ! " ${INVALIDATION_PATHS[@]} " =~ " ${cf_path} " ]]; then
+         INVALIDATION_PATHS+=("$cf_path")
+         # DEBUG: Indicate path was added
+         echo "    (Added to list)"
+      else
+         # DEBUG: Indicate path was duplicate
+         echo "    (Duplicate, skipped)"
+      fi
     fi
   done < <(echo "$SYNC_OUTPUT")
+  echo "--- End Paths Identified ---" # DEBUG
 
-  # Step 3: Invalidate (Rest remains the same)
+  # Step 3: Invalidate
   if [ ${#INVALIDATION_PATHS[@]} -eq 0 ]; then
     echo ""; echo "No files changed. Skipping CloudFront invalidation.";
   else
-    echo ""; echo "Found ${#INVALIDATION_PATHS[@]} changed file(s) requiring invalidation:"
-    # Optional: print paths for debugging BEFORE sending to AWS
-    # printf "  %s\n" "${INVALIDATION_PATHS[@]}"
+    echo ""; echo "Found ${#INVALIDATION_PATHS[@]} unique path(s) requiring invalidation."
     if [ ${#INVALIDATION_PATHS[@]} -gt 1000 ]; then echo "Warning: >1000 paths detected. Consider using a wildcard ('/*')."; fi
-    echo "Creating CloudFront invalidation..."; local INVALIDATION_RESULT
-    INVALIDATION_RESULT=$(aws cloudfront create-invalidation --distribution-id "${distribution_id}" --paths "${INVALIDATION_PATHS[@]}" ${aws_cli_opts} 2>&1) || {
-      echo "Error creating CloudFront invalidation:"; echo "$INVALIDATION_RESULT"; exit 1;
-    }
+
+    # --- Enhanced Debugging for Invalidation Command ---
+    echo ""
+    echo "--- Preparing CloudFront Invalidation Command ---"
+    echo "  Distribution ID: ${distribution_id}"
+    echo "  Paths to Invalidate (${#INVALIDATION_PATHS[@]} items):"
+    # Print each path individually for easy inspection
+    printf "    '%s'\n" "${INVALIDATION_PATHS[@]}"
+    # Construct the full command as a string for display (handle potential quoting issues in echo)
+    local full_cmd_string="aws cloudfront create-invalidation --distribution-id \"${distribution_id}\" --paths"
+    # Add paths one by one for accurate representation of space separation
+    for path in "${INVALIDATION_PATHS[@]}"; do
+        full_cmd_string+=" \"$path\"" # Add each path quoted
+    done
+    [ -n "$aws_cli_opts" ] && full_cmd_string+=" ${aws_cli_opts}" # Add profile/other options if they exist
+    echo "  Full Command String (for review):"
+    echo "    ${full_cmd_string}"
+    echo "--- End Command Preparation ---"
+    # --- End Enhanced Debugging ---
+
+    echo ""
+    echo "Creating CloudFront invalidation..."
+    local INVALIDATION_RESULT
+    # Execute the actual command
+    INVALIDATION_RESULT=$(aws cloudfront create-invalidation \
+      --distribution-id "${distribution_id}" \
+      --paths "${INVALIDATION_PATHS[@]}" \
+      ${aws_cli_opts} 2>&1) || {
+        echo "Error creating CloudFront invalidation:"; echo "$INVALIDATION_RESULT"; exit 1;
+      }
+
+    # (Rest of the success reporting remains the same)
     local INVALIDATION_ID=$(echo "$INVALIDATION_RESULT" | grep -o '"Id": "[^"]*"' | cut -d'"' -f4)
     echo "CloudFront invalidation request submitted successfully."; echo "  Invalidation ID: ${INVALIDATION_ID}"
   fi
@@ -155,70 +189,19 @@ sync_and_invalidate() {
   echo ""; echo "Sync and invalidation finished for Distribution ID ${distribution_id}."
 }
 
-
 # --- Main Function ---
 main() {
-  # --- Configuration (Read from Command Line Arguments) ---
-  if [ "$#" -ne 3 ]; then
-      echo "Usage: $0 <local_source_path> <s3_target_uri> <cloudfront_alias_or_id>"
-      echo "  Example: $0 ./build s3://my-bucket/dashboard www.example.com"
-      echo "  Example: $0 ./dist s3://another-bucket E123ABCDEF4567"
-      exit 1
-  fi
-
-  local local_path="$1"
-  local s3_target_uri="$2"
-  local cf_alias_or_id="$3"
-
-  # Optional AWS Profile from environment
-  local aws_profile="${AWS_PROFILE}" # Keep reading this from env
-  local aws_cli_opts=""
-  if [ -n "$aws_profile" ]; then
-    aws_cli_opts="--profile ${aws_profile}"
-    echo "Using AWS Profile (from env): ${aws_profile}"
-  fi
-
-  # --- Prerequisites and Validation ---
-  if ! check_command "aws"; then
-      echo "Please install AWS CLI first and configure your credentials."
-      exit 1
-  fi
-  if [ ! -d "$local_path" ]; then
-    echo "Error: Local source path ('$local_path') is not a valid directory."
-    exit 1
-  fi
-  if [[ ! "$s3_target_uri" =~ ^s3:// ]]; then
-    echo "Error: S3 target URI ('$s3_target_uri') must start with s3://"
-    exit 1
-  fi
-  if [ -z "$cf_alias_or_id" ]; then
-    echo "Error: CloudFront Alias or ID cannot be empty."
-    exit 1
-  fi
-
-
-  # --- Determine Distribution ID ---
-  local distribution_id=""
-  # Simple check: CloudFront IDs start with 'E' followed by uppercase letters/numbers
-  if [[ "$cf_alias_or_id" =~ ^E[A-Z0-9]+$ ]]; then
-      echo "Using provided value as CloudFront Distribution ID: ${cf_alias_or_id}"
-      distribution_id="$cf_alias_or_id"
-  else
-      # Assume it's an alias and perform lookup (includes jq check/install)
-      echo "Provided value '${cf_alias_or_id}' does not look like a Distribution ID. Assuming it's an Alias."
-      distribution_id=$(get_distribution_id_by_alias "$cf_alias_or_id" "$aws_cli_opts")
-      if [ $? -ne 0 ] || [ -z "$distribution_id" ]; then
-          # Error message printed within get_distribution_id_by_alias
-          exit 1
-      fi
-  fi
-
-  # --- Execute Deployment ---
-  # Pass the arguments directly to the core function
+  if [ "$#" -ne 3 ]; then echo "Usage: $0 <local_source_path> <s3_target_uri> <cloudfront_alias_or_id>"; exit 1; fi
+  local local_path="$1"; local s3_target_uri="$2"; local cf_alias_or_id="$3"
+  local aws_profile="${AWS_PROFILE}"; local aws_cli_opts=""
+  if [ -n "$aws_profile" ]; then aws_cli_opts="--profile ${aws_profile}"; echo "Using AWS Profile (from env): ${aws_profile}"; fi
+  if ! check_command "aws"; then echo "Install AWS CLI."; exit 1; fi
+  if [ ! -d "$local_path" ]; then echo "Error: Local path '$local_path' not found."; exit 1; fi
+  if [[ ! "$s3_target_uri" =~ ^s3:// ]]; then echo "Error: S3 URI '$s3_target_uri' invalid."; exit 1; fi
+  if [ -z "$cf_alias_or_id" ]; then echo "Error: CloudFront Alias/ID empty."; exit 1; fi
+  local distribution_id=""; if [[ "$cf_alias_or_id" =~ ^E[A-Z0-9]+$ ]]; then echo "Using provided value as CF ID: ${cf_alias_or_id}"; distribution_id="$cf_alias_or_id"; else echo "Provided value '${cf_alias_or_id}' not ID. Assuming Alias."; distribution_id=$(get_distribution_id_by_alias "$cf_alias_or_id" "$aws_cli_opts"); if [ $? -ne 0 ] || [ -z "$distribution_id" ]; then exit 1; fi; fi
   sync_and_invalidate "$local_path" "$s3_target_uri" "$distribution_id" "$aws_cli_opts"
-
-  echo ""
-  echo "Deployment process completed successfully."
+  echo ""; echo "Deployment process completed successfully."
 }
 
 # Script Entry Point
