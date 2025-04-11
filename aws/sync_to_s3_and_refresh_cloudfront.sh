@@ -11,7 +11,6 @@ set -e
 
 # --- Helper Functions ---
 
-# (Keep check_command, install_jq_if_missing, get_distribution_id_by_alias as they were)
 # Check if a command exists
 check_command() {
   local cmd="$1"
@@ -53,27 +52,73 @@ get_distribution_id_by_alias() {
   local alias_name="$1"; local aws_cli_opts="$2"
   if ! install_jq_if_missing; then exit 1; fi
   echo "Attempting to find CloudFront Distribution ID for Alias: ${alias_name}..."
+
+  # TEMP DEBUG: Run the command and print raw output first
+  echo "--- AWS CLI Raw Output ---"
+  # Save to file to avoid potential buffering issues with direct pipe + error checking
+  aws cloudfront list-distributions ${aws_cli_opts} > aws_output.json || {
+      echo "AWS CLI command 'list-distributions' failed!"
+      # Attempt to print any error from the file if it exists
+      [ -f aws_output.json ] && cat aws_output.json
+      exit 1
+  }
+  echo "(Output saved to aws_output.json, content below)"
+  cat aws_output.json # Print raw JSON output to logs
+  echo "--- End AWS CLI Raw Output ---"
+
+  # Now run the jq command using the saved file
   local dist_id
-  dist_id=$(aws cloudfront list-distributions ${aws_cli_opts} \
+  dist_id=$(cat aws_output.json \
     | jq -r --arg alias_name "$alias_name" '.DistributionList.Items[] | select(.Aliases.Items[]? == $alias_name) | .Id' 2>&1)
-  if [ $? -ne 0 ] || [[ "$dist_id" == *"error"* ]]; then echo "Error querying CloudFront: $dist_id"; exit 1; fi
-  local id_count; id_count=$(echo "$dist_id" | wc -l | xargs)
-  if [ -z "$dist_id" ]; then echo "Error: No CloudFront distribution found with Alias: ${alias_name}"; exit 1;
-  elif [ "$id_count" -ne 1 ]; then echo "Error: Found multiple (${id_count}) distributions for Alias: ${alias_name}"; echo "$dist_id"; exit 1; fi
-  echo "Found Distribution ID: ${dist_id}"; echo "$dist_id"
+
+  # TEMP DEBUG: Print what jq produced
+  echo "--- JQ Processed Output (dist_id variable) ---"
+  echo "Raw dist_id content: ->${dist_id}<-" # Print what jq produced (might be empty or contain errors)
+  echo "--- End JQ Processed Output ---"
+
+
+  # Original error checks based on jq output
+  if [ $? -ne 0 ] || [[ "$dist_id" == *"error"* ]]; then
+      echo "Error processing CloudFront distributions with jq:"
+      echo "$dist_id" # Print the error captured from jq
+      exit 1
+  fi
+
+  local id_count; id_count=$(echo "$dist_id" | wc -l | xargs) # Trim whitespace
+
+  if [ -z "$dist_id" ]; then
+    echo "Error: JQ processing completed but no CloudFront distribution found matching Alias: ${alias_name}"
+    exit 1
+  elif [ "$id_count" -ne 1 ]; then
+    echo "Error: Found multiple (${id_count}) distributions matching Alias: ${alias_name}. Aliases should be unique."
+    echo "$dist_id" # Print the multiple IDs found
+    exit 1
+  fi
+
+  echo "Found Distribution ID: ${dist_id}";
+  echo "$dist_id" # Return the ID
 }
 
+
 # --- Core Deployment Function ---
-# (sync_and_invalidate function remains unchanged from the previous version accepting s3_target_uri)
 sync_and_invalidate() {
   local local_path="$1"; local s3_target_uri="$2"; local distribution_id="$3"; local aws_cli_opts="$4"
+  # Extract bucket name and prefix from the URI for sed command later
   local bucket_name_from_uri=$(echo "$s3_target_uri" | sed -n 's#^s3://\([^/]*\).*#\1#p')
   local s3_prefix_from_uri=$(echo "$s3_target_uri" | sed -n 's#^s3://[^/]*/\(.*\)#\1#p')
+
   echo ""; echo "Starting sync and invalidation..."
   echo "  Local Path: ${local_path}"; echo "  S3 Target URI: ${s3_target_uri}"; echo "  CloudFront Distribution ID: ${distribution_id}"
+
+  # Step 1: Sync
   echo ""; echo "Syncing files to S3..."
-  local SYNC_OUTPUT; SYNC_OUTPUT=$(aws s3 sync "${local_path}" "${s3_target_uri}" --acl private --delete --no-progress ${aws_cli_opts} 2>&1) || { echo "Error during S3 sync:"; echo "$SYNC_OUTPUT"; exit 1; }
+  local SYNC_OUTPUT;
+  SYNC_OUTPUT=$(aws s3 sync "${local_path}" "${s3_target_uri}" --acl private --delete --no-progress ${aws_cli_opts} 2>&1) || {
+    echo "Error during S3 sync:"; echo "$SYNC_OUTPUT"; exit 1;
+  }
   echo "$SYNC_OUTPUT"; echo "S3 sync completed."
+
+  # Step 2: Parse
   echo ""; echo "Parsing sync output for invalidation..."
   declare -a INVALIDATION_PATHS
   while IFS= read -r line; do
@@ -82,17 +127,26 @@ sync_and_invalidate() {
       local sed_expr; if [ -n "$s3_prefix_from_uri" ]; then sed_expr="s#^s3://${bucket_name_from_uri}/${s3_prefix_from_uri}/##"; else sed_expr="s#^s3://${bucket_name_from_uri}/##"; fi
       local s3_relative_path=$(echo "$s3_path_full_uri" | sed -e "$sed_expr")
       local cf_path="/${s3_relative_path}"
+      # Basic uniqueness check
       if [[ ! " ${INVALIDATION_PATHS[@]} " =~ " ${cf_path} " ]]; then INVALIDATION_PATHS+=("$cf_path"); fi
     fi
   done < <(echo "$SYNC_OUTPUT")
-  if [ ${#INVALIDATION_PATHS[@]} -eq 0 ]; then echo ""; echo "No files changed. Skipping CloudFront invalidation."; else
+
+  # Step 3: Invalidate
+  if [ ${#INVALIDATION_PATHS[@]} -eq 0 ]; then
+    echo ""; echo "No files changed. Skipping CloudFront invalidation.";
+  else
     echo ""; echo "Found ${#INVALIDATION_PATHS[@]} changed file(s) requiring invalidation."
     if [ ${#INVALIDATION_PATHS[@]} -gt 1000 ]; then echo "Warning: >1000 paths detected. Consider using a wildcard ('/*')."; fi
     echo "Creating CloudFront invalidation..."; local INVALIDATION_RESULT
-    INVALIDATION_RESULT=$(aws cloudfront create-invalidation --distribution-id "${distribution_id}" --paths "${INVALIDATION_PATHS[@]}" ${aws_cli_opts} 2>&1) || { echo "Error creating CloudFront invalidation:"; echo "$INVALIDATION_RESULT"; exit 1; }
+    INVALIDATION_RESULT=$(aws cloudfront create-invalidation --distribution-id "${distribution_id}" --paths "${INVALIDATION_PATHS[@]}" ${aws_cli_opts} 2>&1) || {
+      echo "Error creating CloudFront invalidation:"; echo "$INVALIDATION_RESULT"; exit 1;
+    }
     local INVALIDATION_ID=$(echo "$INVALIDATION_RESULT" | grep -o '"Id": "[^"]*"' | cut -d'"' -f4)
     echo "CloudFront invalidation request submitted successfully."; echo "  Invalidation ID: ${INVALIDATION_ID}"
-  fi; echo ""; echo "Sync and invalidation finished for Distribution ID ${distribution_id}."
+  fi
+
+  echo ""; echo "Sync and invalidation finished for Distribution ID ${distribution_id}."
 }
 
 
@@ -144,11 +198,11 @@ main() {
       echo "Using provided value as CloudFront Distribution ID: ${cf_alias_or_id}"
       distribution_id="$cf_alias_or_id"
   else
-      # Assume it's an alias and perform lookup
-      echo "Attempting dynamic lookup for CloudFront Distribution ID using alias: $cf_alias_or_id"
+      # Assume it's an alias and perform lookup (includes jq check/install)
+      echo "Provided value '${cf_alias_or_id}' does not look like a Distribution ID. Assuming it's an Alias."
       distribution_id=$(get_distribution_id_by_alias "$cf_alias_or_id" "$aws_cli_opts")
       if [ $? -ne 0 ] || [ -z "$distribution_id" ]; then
-          echo "Error: Failed to retrieve Distribution ID for alias '$cf_alias_or_id'."
+          # Error message printed within get_distribution_id_by_alias
           exit 1
       fi
   fi
