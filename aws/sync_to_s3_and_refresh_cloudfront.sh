@@ -149,41 +149,52 @@ sync_and_invalidate() {
     echo ""; echo "No files changed. Skipping CloudFront invalidation.";
   else
     echo ""; echo "Found ${#INVALIDATION_PATHS[@]} unique path(s) requiring invalidation."
-    if [ ${#INVALIDATION_PATHS[@]} -gt 1000 ]; then echo "Warning: >1000 paths detected. Consider using a wildcard ('/*')."; fi
+
+    # *** START TEMPORARY HARDCODED PATH TEST ***
+    # Comment out or remove the original dynamic list for this test
+    echo "!!! WARNING: USING HARDCODED PATH FOR INVALIDATION TEST !!!"
+    local TEST_PATHS=("/dashboard/browser/index.html") # Hardcode ONE known path
+    echo "  Test Path(s): ${TEST_PATHS[@]}"
+    # *** END TEMPORARY HARDCODED PATH TEST ***
+
+    # Use TEST_PATHS count for the warning check during the test
+    if [ ${#TEST_PATHS[@]} -gt 1000 ]; then echo "Warning: >1000 paths detected (in test array)."; fi
 
     # --- Enhanced Debugging for Invalidation Command ---
     echo ""
-    echo "--- Preparing CloudFront Invalidation Command ---"
+    # Adjust title for clarity during test
+    echo "--- Preparing CloudFront Invalidation Command (HARDCODED TEST) ---"
     echo "  Distribution ID: ${distribution_id}"
-    echo "  Paths to Invalidate (${#INVALIDATION_PATHS[@]} items):"
-    # Print each path individually for easy inspection
-    printf "    '%s'\n" "${INVALIDATION_PATHS[@]}"
-    # Construct the full command as a string for display (handle potential quoting issues in echo)
+    # Use TEST_PATHS for printing
+    echo "  Paths to Invalidate (${#TEST_PATHS[@]} items):"
+    printf "    '%s'\n" "${TEST_PATHS[@]}"
+    # Construct the command string using TEST_PATHS
     local full_cmd_string="aws cloudfront create-invalidation --distribution-id \"${distribution_id}\" --paths"
-    # Add paths one by one for accurate representation of space separation
-    for path in "${INVALIDATION_PATHS[@]}"; do
+    for path in "${TEST_PATHS[@]}"; do
         full_cmd_string+=" \"$path\"" # Add each path quoted
     done
-    [ -n "$aws_cli_opts" ] && full_cmd_string+=" ${aws_cli_opts}" # Add profile/other options if they exist
+    [ -n "$aws_cli_opts" ] && full_cmd_string+=" ${aws_cli_opts}"
     echo "  Full Command String (for review):"
     echo "    ${full_cmd_string}"
     echo "--- End Command Preparation ---"
     # --- End Enhanced Debugging ---
 
     echo ""
-    echo "Creating CloudFront invalidation..."
+    echo "Creating CloudFront invalidation (HARDCODED TEST)..."
     local INVALIDATION_RESULT
-    # Execute the actual command
+    # *** Use the hardcoded TEST_PATHS array in the AWS command ***
     INVALIDATION_RESULT=$(aws cloudfront create-invalidation \
       --distribution-id "${distribution_id}" \
-      --paths "${INVALIDATION_PATHS[@]}" \
+      --paths "${TEST_PATHS[@]}" \
       ${aws_cli_opts} 2>&1) || {
-        echo "Error creating CloudFront invalidation:"; echo "$INVALIDATION_RESULT"; exit 1;
+        # Adjust error message for clarity
+        echo "Error creating CloudFront invalidation (HARDCODED TEST):"; echo "$INVALIDATION_RESULT"; exit 1;
       }
 
     # (Rest of the success reporting remains the same)
     local INVALIDATION_ID=$(echo "$INVALIDATION_RESULT" | grep -o '"Id": "[^"]*"' | cut -d'"' -f4)
-    echo "CloudFront invalidation request submitted successfully."; echo "  Invalidation ID: ${INVALIDATION_ID}"
+    # Adjust success message for clarity
+    echo "CloudFront invalidation request submitted successfully (HARDCODED TEST)."; echo "  Invalidation ID: ${INVALIDATION_ID}"
   fi
 
   echo ""; echo "Sync and invalidation finished for Distribution ID ${distribution_id}."
