@@ -264,7 +264,8 @@ main() {
   if [ ! -d "$local_path" ]; then echo "Error: Local path '$local_path' not found."; exit 1; fi
   if [[ ! "$s3_target_uri" =~ ^s3:// ]]; then echo "Error: S3 URI '$s3_target_uri' invalid."; exit 1; fi
   if [ -z "$cf_alias_or_id" ]; then echo "Error: CloudFront Alias/ID empty."; exit 1; fi
-  local distribution_id=""; if [[ "$cf_alias_or_id" =~ ^E[A-Z0-9]+$ ]]; then echo "Using provided value as CF ID: ${cf_alias_or_id}"; distribution_id="$cf_alias_or_id"; else echo "Provided value '${cf_alias_or_id}' not ID. Assuming Alias."; distribution_id=$(get_distribution_id_by_alias "$cf_alias_or_id" "$aws_cli_opts"); if [ $? -ne 0 ] || [ -z "$distribution_id" ]; then exit 1; fi; fi
+  local distribution_id=$(get_distribution_id_by_alias "$cf_alias_or_id"
+  echo $distribution_id
   sync_and_invalidate "$local_path" "$s3_target_uri" "$distribution_id" "$aws_cli_opts"
   echo ""; echo "Deployment process completed successfully."
 }
