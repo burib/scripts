@@ -48,55 +48,109 @@ install_jq_if_missing() {
 }
 
 # Function to get CloudFront Distribution ID by Alias (CNAME)
-get_distribution_id_by_alias() {
-  local alias_name="$1"; local aws_cli_opts="$2"
-  if ! install_jq_if_missing; then exit 1; fi
-  echo "Attempting to find CloudFront Distribution ID for Alias: ${alias_name}..."
+#!/bin/bash
 
-  # TEMP DEBUG: Run the command and print raw output first
-  echo "--- AWS CLI Raw Output ---"
+# Placeholder for the actual function if needed
+install_jq_if_missing() {
+  if ! command -v jq &> /dev/null; then
+    printf "Error: 'jq' command not found. Please install jq.\n" >&2
+    return 1
+  fi
+  return 0
+}
+
+get_distribution_id_by_alias() {
+  local alias_name="$1"
+  local aws_cli_opts="$2" # Example: "--profile myprofile --region us-east-1"
+
+  # Ensure jq is available
+  if ! install_jq_if_missing; then exit 1; fi
+
+  # Use printf for status messages, redirecting to stderr
+  printf "Attempting to find CloudFront Distribution ID for Alias: %s...\n" "$alias_name" >&2
+
+  # --- Debugging AWS CLI ---
+  printf "%s\n" "--- AWS CLI Raw Output (stderr) ---" >&2
   # Save to file to avoid potential buffering issues with direct pipe + error checking
-  aws cloudfront list-distributions ${aws_cli_opts} > aws_output.json || {
-      echo "AWS CLI command 'list-distributions' failed!"
-      # Attempt to print any error from the file if it exists
-      [ -f aws_output.json ] && cat aws_output.json
+  if ! aws cloudfront list-distributions ${aws_cli_opts} > aws_output.json; then
+      printf "Error: AWS CLI command 'list-distributions' failed!\n" >&2
+      # Attempt to print any error content captured in the file to stderr
+      [ -f aws_output.json ] && cat aws_output.json >&2
+      # Clean up temp file on error
+      rm -f aws_output.json
       exit 1
-  }
-  echo "(Output saved to aws_output.json, content below)"
-  cat aws_output.json # Print raw JSON output to logs
-  echo "--- End AWS CLI Raw Output ---"
+  fi
+  printf "%s\n" "(Output saved to aws_output.json, content below printed to stderr)" >&2
+  cat aws_output.json >&2 # Print raw JSON output to stderr for debugging
+  printf "%s\n" "--- End AWS CLI Raw Output (stderr) ---" >&2
+  # --- End Debugging AWS CLI ---
 
   # Now run the jq command using the saved file
-  local dist_id
-  dist_id=$(cat aws_output.json \
-    | jq -r --arg alias_name "$alias_name" '.DistributionList.Items[] | select(.Aliases.Items[]? == $alias_name) | .Id' 2>&1)
+  local dist_id_output # Capture jq output/errors
+  local jq_exit_status
 
-  # TEMP DEBUG: Print what jq produced
-  echo "--- JQ Processed Output (dist_id variable) ---"
-  echo "Raw dist_id content: ->${dist_id}<-" # Print what jq produced (might be empty or contain errors)
-  echo "--- End JQ Processed Output ---"
+  # Capture jq output AND exit status separately
+  # Redirect jq's stderr (potential errors) to stdout to capture it in the variable
+  dist_id_output=$(cat aws_output.json | jq -r --arg alias_name "$alias_name" \
+    '.DistributionList.Items[] | select(.Aliases.Items[]? == $alias_name) | .Id' 2>&1)
+  jq_exit_status=$?
 
+  # Clean up the temporary file now that we're done with it
+  rm -f aws_output.json
 
-  # Original error checks based on jq output
-  if [ $? -ne 0 ] || [[ "$dist_id" == *"error"* ]]; then
-      echo "Error processing CloudFront distributions with jq:"
-      echo "$dist_id" # Print the error captured from jq
+  # --- Debugging JQ ---
+  printf "%s\n" "--- JQ Processed Output (dist_id_output variable, stderr) ---" >&2
+  # Print raw content captured from jq (might be ID, empty, or error message) to stderr
+  printf "Raw dist_id_output content: ->%s<-\n" "$dist_id_output" >&2
+  printf "JQ exit status: %d\n" "$jq_exit_status" >&2
+  printf "%s\n" "--- End JQ Processed Output (stderr) ---" >&2
+  # --- End Debugging JQ ---
+
+  # Check jq exit status first
+  if [ "$jq_exit_status" -ne 0 ]; then
+      printf "Error: jq command failed with exit status %d:\n" "$jq_exit_status" >&2
+      printf "%s\n" "$dist_id_output" >&2 # Print the captured error output from jq
       exit 1
   fi
 
-  local id_count; id_count=$(echo "$dist_id" | wc -l | xargs) # Trim whitespace
+  # If jq succeeded (exit 0), check the content of the output
+  # Check if jq output indicates an internal jq error despite exit 0 (less common)
+  # Note: Simple checks like *error* might have false positives if an ID contained 'error'.
+  # Relying on exit status is generally better. This check is kept from the original logic.
+  if [[ "$dist_id_output" == *"error"* ]]; then
+      printf "Error: Potential error detected in jq output processing:\n" >&2
+      printf "%s\n" "$dist_id_output" >&2
+      exit 1
+  fi
 
+  # Now process the potentially valid ID(s)
+  local dist_id="$dist_id_output"
+  local id_count
+
+  # Count lines in the output, handle potential leading/trailing whitespace
+  # Using parameter expansion and wc for robustness
+  id_count=$(printf "%s" "$dist_id" | wc -l)
+  id_count="${id_count//[[:space:]]/}" # Remove whitespace from wc output
+
+  # Check if any ID was found
   if [ -z "$dist_id" ]; then
-    echo "Error: JQ processing completed but no CloudFront distribution found matching Alias: ${alias_name}"
+    printf "Error: No CloudFront distribution found matching Alias: %s\n" "$alias_name" >&2
     exit 1
+  # Check if exactly one ID was found
   elif [ "$id_count" -ne 1 ]; then
-    echo "Error: Found multiple (${id_count}) distributions matching Alias: ${alias_name}. Aliases should be unique."
-    echo "$dist_id" # Print the multiple IDs found
+    printf "Error: Found multiple (%s) distributions matching Alias: %s. Aliases should be unique.\n" "$id_count" "$alias_name" >&2
+    printf "Found IDs:\n%s\n" "$dist_id" >&2 # Print the multiple IDs found
     exit 1
   fi
 
-  echo "Found Distribution ID: ${dist_id}";
-  echo "$dist_id" # Return the ID
+  # Success: Found exactly one ID
+  printf "Found Distribution ID: %s (message to stderr)\n" "$dist_id" >&2;
+
+  # Use echo for the final output to stdout, as requested.
+  # This is the intended "return value" of the function via stdout.
+  echo "$dist_id"
+
+  return 0 # Indicate success
 }
 
 sync_and_invalidate() {
