@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to sync a local directory to S3 and invalidate changed files in CloudFront.
-# Usage: ./sync_to_s3_and_refresh_cloudfront.sh <local_source_path> <s3_target_uri> <cloudfront_alias_or_id> [--profile <aws_profile>] [--region <aws_region>]
+# Usage: ./sync_to_s3_and_refresh_cloudfront.sh <local_source_path> <s3_target_uri> <cloudfront_alias_or_id> [aws_cli_options...]
 #   <local_source_path> : Path to the local directory containing files to sync (e.g., ./build).
 #   <s3_target_uri>     : Full S3 URI including bucket and optional path (e.g., s3://my-bucket/dashboard).
 #   <cloudfront_alias_or_id>: CloudFront distribution alias (e.g., www.example.com) OR Distribution ID (e.g., E123ABCDEF4567).
@@ -37,12 +37,12 @@ check_command() {
 install_jq_if_missing() {
   if check_command "jq"; then return 0; fi
   log_info "Required command 'jq' not found. Attempting to install..."
-  # Use sudo only if not already root
   local sudo_cmd=""
   if [[ $EUID -ne 0 ]]; then
     sudo_cmd="sudo"
   fi
 
+  # Attempt installation using common package managers
   if command -v apt-get &> /dev/null; then
     log_info "Trying: ${sudo_cmd} apt-get update && ${sudo_cmd} apt-get install -y jq"
     if ${sudo_cmd} apt-get update && ${sudo_cmd} apt-get install -y jq; then log_info "jq installed via apt."; else log_error "Failed via apt."; return 1; fi
@@ -61,6 +61,7 @@ install_jq_if_missing() {
   else
     log_error "Could not detect known package manager. Please install 'jq' manually."; return 1
   fi
+  # Verify installation
   if ! check_command "jq"; then log_error "Verification failed after install attempt. Install 'jq' manually."; return 1; fi
   return 0
 }
@@ -69,67 +70,55 @@ install_jq_if_missing() {
 # Function to get CloudFront Distribution ID by Alias (CNAME)
 get_distribution_id_by_alias() {
   local alias_name="$1"
-  local aws_cli_opts=("${@:2}") # Capture remaining args as array for AWS CLI options
+  local -a aws_cli_opts=("${@:2}") # Capture remaining args as array for AWS CLI options
 
-  # Ensure jq is available (calls the global function)
   if ! install_jq_if_missing; then exit 1; fi
 
   log_info "Attempting to find CloudFront Distribution ID for Alias: ${alias_name}..."
 
-  # Create a temporary file securely
   local aws_output_file
   aws_output_file=$(mktemp)
-  # Ensure cleanup on exit
+  # Ensure cleanup on exit, including errors or script termination
   trap 'rm -f "$aws_output_file"' EXIT
 
-  log_info "--- AWS CLI Raw Output (stderr) ---"
+  # Run AWS CLI command, redirecting JSON output to temp file
+  # stderr from aws cli (errors, warnings) will still go to the script's stderr
   if ! aws cloudfront list-distributions "${aws_cli_opts[@]}" > "$aws_output_file"; then
       log_error "AWS CLI command 'list-distributions' failed!"
-      # Attempt to print any error content captured in the file to stderr
+      # Attempt to print any error content captured in the file (though AWS errors usually go to stderr)
       cat "$aws_output_file" >&2
-      # Cleanup is handled by trap
       exit 1
   fi
-  log_info "(Raw AWS output saved to temporary file, content below printed to stderr)"
-  cat "$aws_output_file" >&2 # Print raw JSON output to stderr for debugging
-  log_info "--- End AWS CLI Raw Output (stderr) ---"
 
-  # Now run the jq command using the saved file
-  local dist_id_output # Capture jq output/errors
+  # Process the JSON file with JQ
+  local dist_id_output
   local jq_exit_status
-
-  # Capture jq output AND exit status separately
+  # Capture jq's stdout (the ID) and stderr (jq errors) into dist_id_output
   dist_id_output=$(jq -r --arg alias_name "$alias_name" \
     '.DistributionList.Items[] | select(.Aliases.Items[]? == $alias_name) | .Id' < "$aws_output_file" 2>&1)
   jq_exit_status=$?
 
-  # Temp file no longer needed, cleanup handled by trap, but can remove earlier if desired
-  # rm -f "$aws_output_file"
-  # trap - EXIT # Remove trap if cleaning up manually here
-
-  log_info "--- JQ Processed Output (dist_id_output variable, stderr) ---"
-  log_info "Raw dist_id_output content: ->${dist_id_output}<-"
-  log_info "JQ exit status: ${jq_exit_status}"
-  log_info "--- End JQ Processed Output (stderr) ---"
-
-  # Check jq exit status first
+  # Check JQ execution status first
   if [ "$jq_exit_status" -ne 0 ]; then
       log_error "jq command failed with exit status ${jq_exit_status}:"
       printf "%s\n" "$dist_id_output" >&2 # Print the captured error output from jq
       exit 1
   fi
 
-  # Check if jq output indicates an internal jq error despite exit 0 (less common)
+  # Basic check for literal "error" in jq's output (less common if exit status is 0)
   if [[ "$dist_id_output" == *"error"* ]]; then
       log_error "Potential error detected in jq output processing:"
       printf "%s\n" "$dist_id_output" >&2
       exit 1
   fi
 
+  # Process the potentially valid ID(s) from jq's output
   local dist_id="$dist_id_output"
   local id_count
-  id_count=$(printf "%s" "$dist_id" | wc -l | tr -d '[:space:]') # Trim whitespace robustly
+  # Count lines in the output, trimming whitespace robustly
+  id_count=$(printf "%s" "$dist_id" | wc -l | tr -d '[:space:]')
 
+  # Validate the number of IDs found
   if [ -z "$dist_id" ]; then
     log_error "No CloudFront distribution found matching Alias: ${alias_name}"
     exit 1
@@ -140,11 +129,11 @@ get_distribution_id_by_alias() {
     exit 1
   fi
 
-  log_info "Found Distribution ID: ${dist_id} (message to stderr)";
+  # Success: Found exactly one ID
+  log_info "Found Distribution ID: ${dist_id}";
 
   # Use echo for the final output to stdout - this is the function's result.
   echo "$dist_id"
-
   return 0 # Indicate success
 }
 
@@ -155,108 +144,87 @@ sync_and_invalidate() {
   local -a aws_cli_opts=("${@:4}") # Capture remaining args as array
 
   local bucket_name_from_uri
+  # Extract bucket name robustly
   bucket_name_from_uri=$(echo "$s3_target_uri" | sed -n 's#^s3://\([^/]*\).*#\1#p')
+  if [ -z "$bucket_name_from_uri" ]; then
+      log_error "Could not extract bucket name from S3 URI: $s3_target_uri"
+      exit 1
+  fi
 
   log_info ""
   log_info "Starting sync and invalidation..."
   log_info "  Local Path: ${local_path}"
   log_info "  S3 Target URI: ${s3_target_uri}"
   log_info "  CloudFront Distribution ID: ${distribution_id}"
-  log_info "  AWS CLI Options: ${aws_cli_opts[*]}" # Show options being used
 
-  # Step 1: Sync
+  # Step 1: Sync files to S3
   log_info ""
   log_info "Syncing files to S3..."
   local SYNC_OUTPUT
-  # Use process substitution and tee to capture output while showing progress if needed
-  # Using --no-progress here, so just capture directly
+  # Capture stdout and stderr from the sync command
   if ! SYNC_OUTPUT=$(aws s3 sync "${local_path}" "${s3_target_uri}" --acl private --delete --no-progress "${aws_cli_opts[@]}" 2>&1); then
     log_error "Error during S3 sync:"
-    printf "%s\n" "$SYNC_OUTPUT" >&2
+    printf "%s\n" "$SYNC_OUTPUT" >&2 # Print the error output
     exit 1
   fi
-  printf "%s\n" "$SYNC_OUTPUT" >&2 # Print sync output to stderr for logs
+  # Optional: Print sync summary if needed, otherwise just success message
+  # printf "%s\n" "$SYNC_OUTPUT" >&2
   log_info "S3 sync completed."
 
-  # Step 2: Parse
+  # Step 2: Parse sync output to find changed/deleted files for invalidation
   log_info ""
-  log_info "Parsing sync output for invalidation..."
+  log_info "Parsing sync output for invalidation paths..."
   declare -a INVALIDATION_PATHS
-  log_info "--- Paths identified for invalidation (pre-processing): ---" # DEBUG
   while IFS= read -r line; do
     # Match lines indicating upload, copy, or delete operations
     if [[ "$line" =~ ^(upload|copy|delete): ]]; then
       local s3_path_full_uri
-      # Extract the target S3 path robustly
+      # Extract the target S3 path robustly using regex capture groups
       if [[ "$line" =~ ^(upload|copy):.*[[:space:]]to[[:space:]](s3://.*) ]]; then
          s3_path_full_uri="${BASH_REMATCH[2]}"
       elif [[ "$line" =~ ^delete:[[:space:]](s3://.*) ]]; then
          s3_path_full_uri="${BASH_REMATCH[1]}"
       else
-         log_info "  Skipping unparseable line: $line"
-         continue # Skip lines we can't parse reliably
+         # Skip lines that don't match expected format to avoid errors
+         continue
       fi
 
-      # Remove only the 's3://<bucket_name>/' part to get the full object key
+      # Derive the S3 object key and the corresponding CloudFront path
       local s3_object_key
       s3_object_key=$(echo "$s3_path_full_uri" | sed -e "s#^s3://${bucket_name_from_uri}/##")
-      # Prepend '/' to the object key for the CloudFront path
       local cf_path="/${s3_object_key}"
 
-      log_info "  Generated CF Path: ->${cf_path}<-"
-
-      # Basic uniqueness check (safe for typical numbers of paths)
+      # Add the path to the list if it's not already there
+      # This simple check is usually sufficient unless dealing with thousands of paths frequently
       if [[ ! " ${INVALIDATION_PATHS[@]} " =~ " ${cf_path} " ]]; then
          INVALIDATION_PATHS+=("$cf_path")
-         log_info "    (Added to list)"
-      else
-         log_info "    (Duplicate, skipped)"
       fi
     fi
-  done < <(printf "%s\n" "$SYNC_OUTPUT") # Feed captured output line by line
-  log_info "--- End Paths Identified ---" # DEBUG
+  done < <(printf "%s\n" "$SYNC_OUTPUT") # Feed captured sync output line by line
 
-  # Step 3: Invalidate
+  # Step 3: Create CloudFront invalidation if necessary
   if [ ${#INVALIDATION_PATHS[@]} -eq 0 ]; then
     log_info ""
-    log_info "No files changed or deleted. Skipping CloudFront invalidation.";
+    log_info "No file changes detected in S3 sync. Skipping CloudFront invalidation.";
   else
     log_info ""
     log_info "Found ${#INVALIDATION_PATHS[@]} unique path(s) requiring invalidation."
 
-    # Check CloudFront limits (soft limit 1000 free per month, hard limit 3000 per invalidation)
+    # Check against AWS CloudFront limits before attempting invalidation
     if [ ${#INVALIDATION_PATHS[@]} -gt 1000 ]; then
       log_info "Warning: More than 1000 paths detected (${#INVALIDATION_PATHS[@]}). This might exceed free tier invalidation limits or approach API limits."
-      log_info "Consider invalidating '/*' if appropriate, or batching invalidations if necessary."
     fi
-    # AWS hard limit check
     if [ ${#INVALIDATION_PATHS[@]} -gt 3000 ]; then
         log_error "Too many paths (${#INVALIDATION_PATHS[@]}) for a single CloudFront invalidation request (limit 3000)."
-        log_error "Please adjust your deployment or use a wildcard invalidation like '/*'."
+        log_error "Deployment aborted. Consider using a wildcard invalidation like '/*' or restructuring."
         exit 1
     fi
 
     log_info ""
-    log_info "--- Preparing CloudFront Invalidation Command ---"
-    log_info "  Distribution ID: ${distribution_id}"
-    log_info "  Paths to Invalidate (${#INVALIDATION_PATHS[@]} items):"
-    # Use printf to list paths safely, one per line, indented
-    printf "    '%s'\n" "${INVALIDATION_PATHS[@]}" >&2
-    # Construct the command string for review (optional, but good for complex commands)
-    local full_cmd_string="aws cloudfront create-invalidation --distribution-id \"${distribution_id}\" --paths"
-    for path in "${INVALIDATION_PATHS[@]}"; do
-        full_cmd_string+=" '${path}'" # Use single quotes for safety, assuming no single quotes in paths
-    done
-    full_cmd_string+=" ${aws_cli_opts[*]}" # Add other AWS CLI options
-    log_info "  Full Command Preview (for review):"
-    log_info "    ${full_cmd_string}"
-    log_info "--- End Command Preparation ---"
-
-
-    log_info ""
     log_info "Creating CloudFront invalidation..."
     local INVALIDATION_RESULT
-    # Use the dynamically generated INVALIDATION_PATHS array
+    # Execute the invalidation command, passing paths as separate arguments
+    # Capture stdout/stderr
     if ! INVALIDATION_RESULT=$(aws cloudfront create-invalidation \
       --distribution-id "${distribution_id}" \
       --paths "${INVALIDATION_PATHS[@]}" \
@@ -266,22 +234,23 @@ sync_and_invalidate() {
         exit 1
       fi
 
-    # Extract Invalidation ID more reliably using jq if available (fallback to grep/cut)
+    # Extract the Invalidation ID from the successful result
     local INVALIDATION_ID
+    # Prefer jq for reliable parsing if available
     if command -v jq &> /dev/null; then
       INVALIDATION_ID=$(printf "%s" "$INVALIDATION_RESULT" | jq -r '.Invalidation.Id // empty')
-    else
+    else # Fallback to grep/cut if jq is not present
       INVALIDATION_ID=$(printf "%s" "$INVALIDATION_RESULT" | grep -o '"Id": "[^"]*"' | head -n 1 | cut -d'"' -f4)
     fi
 
+    # Report the outcome
     if [ -n "$INVALIDATION_ID" ]; then
       log_info "CloudFront invalidation request submitted successfully.";
       log_info "  Invalidation ID: ${INVALIDATION_ID}"
     else
-      log_error "Could not extract Invalidation ID from the result:"
+      # This indicates success from AWS CLI but failure to parse the ID
+      log_error "CloudFront invalidation submitted, but could not extract Invalidation ID from the result:"
       printf "%s\n" "$INVALIDATION_RESULT" >&2
-      # Decide if this is a fatal error or just a reporting issue
-      # exit 1
     fi
   fi
 
@@ -295,24 +264,25 @@ main() {
   local local_path=""
   local s3_target_uri=""
   local cf_alias_or_id=""
-  declare -a aws_cli_opts=() # Array to hold AWS options
+  declare -a aws_cli_opts=() # Array to hold AWS options like --profile, --region
 
-  # Simple positional argument parsing + catch-all for AWS options
+  # Check for minimum required arguments
   if [ "$#" -lt 3 ]; then
     log_error "Usage: $0 <local_source_path> <s3_target_uri> <cloudfront_alias_or_id> [aws_cli_options...]"
     log_error "Example: $0 ./build s3://my-bucket/app www.example.com --profile myprof --region us-west-2"
     exit 1
   fi
 
+  # Assign positional arguments
   local_path="$1"
   s3_target_uri="$2"
   cf_alias_or_id="$3"
-  # All remaining arguments are considered AWS CLI options
+  # Treat all subsequent arguments as options for the AWS CLI
   if [ "$#" -gt 3 ]; then
       aws_cli_opts=("${@:4}")
   fi
 
-  # --- Initial Checks ---
+  # --- Initial Validations ---
   if ! check_command "aws"; then log_error "AWS CLI is required. Please install it."; exit 1; fi
   if [ ! -d "$local_path" ]; then log_error "Local source path '$local_path' not found or is not a directory."; exit 1; fi
   if [[ ! "$s3_target_uri" =~ ^s3://[^/]+ ]]; then log_error "S3 target URI '$s3_target_uri' seems invalid. Expected format: s3://bucket-name[/optional-prefix]"; exit 1; fi
@@ -322,31 +292,31 @@ main() {
   log_info "Local Source: $local_path"
   log_info "S3 Target: $s3_target_uri"
   log_info "CloudFront Identifier: $cf_alias_or_id"
-  log_info "AWS CLI Options: ${aws_cli_opts[*]}"
+  # Avoid printing CLI opts unless debugging: log_info "AWS CLI Options: ${aws_cli_opts[*]}"
 
 
-  # --- Determine CloudFront Distribution ID ---
+  # --- Determine the CloudFront Distribution ID ---
   local distribution_id=""
-  # Regex to check if input looks like a CloudFront Distribution ID (E + 13 alphanumeric chars)
+  # Check if the provided identifier looks like a CloudFront Distribution ID
   if [[ "$cf_alias_or_id" =~ ^E[A-Z0-9]{13}$ ]]; then
-    log_info "Input '$cf_alias_or_id' looks like a Distribution ID. Using it directly."
+    log_info "Input '$cf_alias_or_id' appears to be a Distribution ID. Using it directly."
     distribution_id="$cf_alias_or_id"
   else
+    # If it doesn't look like an ID, assume it's an alias and try to resolve it
     log_info "Input '$cf_alias_or_id' does not look like a Distribution ID. Attempting to resolve it as an Alias..."
-    # Pass the AWS CLI options to the lookup function
-    # Capture the output (the ID) from stdout
+    # Call the helper function, passing any extra AWS CLI options
+    # Capture the ID (printed to stdout by the function) into the variable
     distribution_id=$(get_distribution_id_by_alias "$cf_alias_or_id" "${aws_cli_opts[@]}")
-    # get_distribution_id_by_alias exits on error, so if we reach here, $distribution_id should be set
+    # The function exits on error, so if we continue, $distribution_id should be valid.
+    # Add a safeguard check just in case.
     if [ -z "$distribution_id" ]; then
-        # This case should ideally not be reached due to checks within the function, but as a safeguard:
-        log_error "Failed to retrieve Distribution ID for alias '$cf_alias_or_id'."
+        log_error "Failed to retrieve a valid Distribution ID for alias '$cf_alias_or_id'."
         exit 1
     fi
-    # No need to echo here, the function already printed status to stderr and ID to stdout (captured)
   fi
 
-  # --- Execute Sync and Invalidation ---
-  # Pass the determined ID and AWS CLI options
+  # --- Execute the Sync and Invalidation Logic ---
+  # Pass the determined distribution ID and any AWS CLI options
   sync_and_invalidate "$local_path" "$s3_target_uri" "$distribution_id" "${aws_cli_opts[@]}"
 
   log_info ""
@@ -354,7 +324,8 @@ main() {
 }
 
 # --- Script Entry Point ---
-# Pass all arguments to main
+# Pass all command-line arguments received by the script to the main function
 main "$@"
 
+# Exit with success status code
 exit 0
